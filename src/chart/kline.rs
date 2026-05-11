@@ -771,17 +771,62 @@ impl KlineChart {
                         .data_source
                         .visible_price_range(start_interval, end_interval)
                     {
-                        let padding = (highest - lowest) * 0.05;
-                        let price_span = (highest - lowest) + (2.0 * padding);
+                        let chart_height = chart.bounds.height;
+                        let tick_size = chart.tick_size.to_f32_lossy();
 
-                        if price_span > 0.0 && chart.bounds.height > f32::EPSILON {
-                            let padded_highest = highest + padding;
-                            let chart_height = chart.bounds.height;
-                            let tick_size = chart.tick_size.to_f32_lossy();
+                        if chart_height > f32::EPSILON && tick_size > 0.0 {
+                            let (fit_lowest, fit_highest) =
+                                if let KlineChartKind::Footprint { .. } = self.kind {
+                                    if let Some((footprint_low, footprint_high)) = self
+                                        .data_source
+                                        .visible_footprint_price_range(start_interval, end_interval)
+                                    {
+                                        let half_tick = tick_size * 0.5;
+                                        (
+                                            footprint_low.to_f32_lossy() - half_tick,
+                                            footprint_high.to_f32_lossy() + half_tick,
+                                        )
+                                    } else {
+                                        (lowest, highest)
+                                    }
+                                } else {
+                                    (lowest, highest)
+                                };
 
-                            if tick_size > 0.0 {
-                                chart.cell_height = (chart_height * tick_size) / price_span;
-                                chart.base_price_y = Price::from_f32(padded_highest);
+                            let visible_span = (fit_highest - fit_lowest).max(tick_size);
+                            let base_padding = visible_span * 0.05; // 5% padding on top and bottom
+
+                            let mut top_padding = base_padding;
+                            let mut bottom_padding = base_padding;
+
+                            if let KlineChartKind::Footprint { clusters, .. } = self.kind {
+                                let provisional_span = visible_span + top_padding + bottom_padding;
+                                if provisional_span > 0.0 {
+                                    let provisional_cell_height =
+                                        (chart_height * tick_size) / provisional_span;
+
+                                    let outer_padding = price_padding_from_pixels(
+                                        provisional_cell_height,
+                                        tick_size,
+                                    );
+
+                                    top_padding += outer_padding;
+                                    bottom_padding += outer_padding;
+
+                                    bottom_padding = bottom_padding.max(footprint_summary_padding(
+                                        provisional_cell_height,
+                                        chart.scaling,
+                                        chart.cell_width,
+                                        tick_size,
+                                        clusters,
+                                    ));
+                                }
+                            }
+
+                            let padded_span = visible_span + top_padding + bottom_padding;
+                            if padded_span > 0.0 {
+                                chart.cell_height = (chart_height * tick_size) / padded_span;
+                                chart.base_price_y = Price::from_f32(fit_highest + top_padding);
                                 chart.translation.y = -chart_height / 2.0;
                             }
                         }
@@ -888,13 +933,8 @@ impl canvas::Program<Message> for KlineChart {
                     let cell_height_unscaled = chart.cell_height * chart.scaling;
                     let cell_width_unscaled = chart.cell_width * chart.scaling;
 
-                    let text_size = {
-                        let text_size_from_height = cell_height_unscaled.round().min(16.0) - 3.0;
-                        let text_size_from_width =
-                            (cell_width_unscaled * 0.1).round().min(16.0) - 3.0;
-
-                        text_size_from_height.min(text_size_from_width)
-                    };
+                    let text_size =
+                        footprint_cluster_text_size(cell_height_unscaled, cell_width_unscaled);
 
                     let candle_width = 0.1 * chart.cell_width;
                     let content_spacing = ContentGaps::from_view(candle_width, chart.scaling);
@@ -912,13 +952,11 @@ impl canvas::Program<Message> for KlineChart {
                         }
                     });
 
-                    let show_text = {
-                        let min_w = match clusters {
-                            ClusterKind::VolumeProfile | ClusterKind::DeltaProfile => 80.0,
-                            ClusterKind::BidAsk => 120.0,
-                        };
-                        should_show_text(cell_height_unscaled, cell_width_unscaled, min_w)
-                    };
+                    let show_text = should_show_text(
+                        cell_height_unscaled,
+                        cell_width_unscaled,
+                        footprint_cluster_min_width(*clusters),
+                    );
 
                     draw_all_npocs(
                         &self.data_source,
@@ -1602,14 +1640,14 @@ fn draw_clusters(
     }
 
     if show_text {
-        let mut total_buy = 0.0;
-        let mut total_sell = 0.0;
-        let mut total_delta = 0.0;
+        let mut total_buy = Qty::zero();
+        let mut total_sell = Qty::zero();
+        let mut total_delta = Qty::zero();
 
         for group in footprint.trades.values() {
-            total_buy += f32::from(group.buy_qty);
-            total_sell += f32::from(group.sell_qty);
-            total_delta += f32::from(group.delta_qty());
+            total_buy += group.buy_qty;
+            total_sell += group.sell_qty;
+            total_delta += group.delta_qty();
         }
 
         let summary_y = price_to_y(kline.low) + cell_height * 1.5;
@@ -1619,7 +1657,7 @@ fn draw_clusters(
 
         draw_cluster_text(
             frame,
-            &format!("V: {}", abbr_large_numbers(total_vol)),
+            &format!("V: {}", abbr_large_numbers(total_vol.to_f32_lossy())),
             Point::new(x_position, summary_y),
             text_size * 0.9,
             palette.background.weakest.text,
@@ -1627,7 +1665,7 @@ fn draw_clusters(
             Alignment::Start,
         );
 
-        let delta_color = if total_delta >= 0.0 {
+        let delta_color = if total_delta >= Qty::zero() {
             palette.success.base.color
         } else {
             palette.danger.base.color
@@ -1635,7 +1673,7 @@ fn draw_clusters(
 
         draw_cluster_text(
             frame,
-            &format!("Δ: {}", abbr_large_numbers(total_delta)),
+            &format!("Δ: {}", abbr_large_numbers(total_delta.to_f32_lossy())),
             Point::new(x_position, summary_y + line_spacing),
             text_size * 0.9,
             delta_color,
@@ -1922,6 +1960,71 @@ impl BidAskArea {
             imb_marker_width: candle_width,
         }
     }
+}
+
+#[inline]
+fn footprint_cluster_min_width(cluster_kind: ClusterKind) -> f32 {
+    match cluster_kind {
+        ClusterKind::VolumeProfile | ClusterKind::DeltaProfile => 80.0,
+        ClusterKind::BidAsk => 120.0,
+    }
+}
+
+#[inline]
+fn footprint_cluster_text_size(cell_height_unscaled: f32, cell_width_unscaled: f32) -> f32 {
+    let text_size_from_height = cell_height_unscaled.round().min(16.0) - 3.0;
+    let text_size_from_width = (cell_width_unscaled * 0.1).round().min(16.0) - 3.0;
+
+    text_size_from_height.min(text_size_from_width)
+}
+
+#[inline]
+fn price_padding_from_pixels(cell_height: f32, tick_size: f32) -> f32 {
+    const OUTER_BOUND_PADDING_PX: f32 = 4.0;
+
+    if cell_height <= f32::EPSILON {
+        return 0.0;
+    }
+
+    (OUTER_BOUND_PADDING_PX / cell_height) * tick_size
+}
+
+fn footprint_summary_padding(
+    cell_height: f32,
+    scaling: f32,
+    cell_width: f32,
+    tick_size: f32,
+    cluster_kind: ClusterKind,
+) -> f32 {
+    if cell_height <= f32::EPSILON {
+        return 0.0;
+    }
+
+    let cell_height_unscaled = cell_height * scaling;
+    let cell_width_unscaled = cell_width * scaling;
+
+    if !should_show_text(
+        cell_height_unscaled,
+        cell_width_unscaled,
+        footprint_cluster_min_width(cluster_kind),
+    ) {
+        return 0.0;
+    }
+
+    let text_size = footprint_cluster_text_size(cell_height_unscaled, cell_width_unscaled);
+    let line_spacing = text_size * 1.2;
+
+    let summary_text_height_px = text_size * 0.9;
+    let summary_y_start_px = cell_height * 1.5;
+
+    let second_line_y_start_px = summary_y_start_px + line_spacing;
+    let summary_y_end_px = second_line_y_start_px + summary_text_height_px;
+
+    let extra_bottom_padding_px = summary_text_height_px;
+    let summary_y_end_with_padding_px = summary_y_end_px + extra_bottom_padding_px;
+    let summary_ticks = summary_y_end_with_padding_px / cell_height;
+
+    summary_ticks * tick_size
 }
 
 #[inline]
