@@ -1600,6 +1600,49 @@ fn draw_clusters(
             );
         }
     }
+
+    if show_text {
+        let mut total_buy = 0.0;
+        let mut total_sell = 0.0;
+        let mut total_delta = 0.0;
+
+        for group in footprint.trades.values() {
+            total_buy += f32::from(group.buy_qty);
+            total_sell += f32::from(group.sell_qty);
+            total_delta += f32::from(group.delta_qty());
+        }
+
+        let summary_y = price_to_y(kline.low) + cell_height * 1.5;
+        let line_spacing = text_size * 1.2;
+
+        let total_vol = total_buy + total_sell;
+
+        draw_cluster_text(
+            frame,
+            &format!("V: {}", abbr_large_numbers(total_vol)),
+            Point::new(x_position, summary_y),
+            text_size * 0.9,
+            palette.background.weakest.text,
+            Alignment::Center,
+            Alignment::Start,
+        );
+
+        let delta_color = if total_delta >= 0.0 {
+            palette.success.base.color
+        } else {
+            palette.danger.base.color
+        };
+
+        draw_cluster_text(
+            frame,
+            &format!("Δ: {}", abbr_large_numbers(total_delta)),
+            Point::new(x_position, summary_y + line_spacing),
+            text_size * 0.9,
+            delta_color,
+            Alignment::Center,
+            Alignment::Start,
+        );
+    }
 }
 
 fn draw_imbalance_markers(
