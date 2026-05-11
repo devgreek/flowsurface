@@ -1612,29 +1612,6 @@ fn draw_clusters(
             total_delta += f32::from(group.delta_qty());
         }
 
-        let candle_center_x = match cluster_kind {
-            ClusterKind::VolumeProfile | ClusterKind::DeltaProfile => {
-                ProfileArea::new(
-                    content_left,
-                    content_right,
-                    candle_width,
-                    spacing,
-                    imbalance.is_some(),
-                )
-                .candle_center_x
-            }
-            ClusterKind::BidAsk => {
-                BidAskArea::new(
-                    x_position,
-                    content_left,
-                    content_right,
-                    candle_width,
-                    spacing,
-                )
-                .candle_center_x
-            }
-        };
-
         let summary_y = price_to_y(kline.low) + cell_height * 1.5;
         let line_spacing = text_size * 1.2;
 
@@ -1643,7 +1620,7 @@ fn draw_clusters(
         draw_cluster_text(
             frame,
             &format!("V: {}", abbr_large_numbers(total_vol)),
-            Point::new(candle_center_x, summary_y),
+            Point::new(x_position, summary_y),
             text_size * 0.9,
             palette.background.weakest.text,
             Alignment::Center,
@@ -1659,7 +1636,7 @@ fn draw_clusters(
         draw_cluster_text(
             frame,
             &format!("Δ: {}", abbr_large_numbers(total_delta)),
-            Point::new(candle_center_x, summary_y + line_spacing),
+            Point::new(x_position, summary_y + line_spacing),
             text_size * 0.9,
             delta_color,
             Alignment::Center,
