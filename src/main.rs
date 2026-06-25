@@ -40,25 +40,34 @@ use iced::{
 use std::{borrow::Cow, collections::HashMap, vec};
 
 fn main() {
-    logger::setup(cfg!(debug_assertions)).expect("Failed to initialize logger");
+    logger::install_panic_hook();
+
+    if let Err(err) = logger::setup(cfg!(debug_assertions)) {
+        logger::report_stderr(&format!("Failed to initialize logger: {err}"));
+    }
 
     std::thread::spawn(data::cleanup_old_market_data);
 
-    let _ = iced::daemon(Flowsurface::new, Flowsurface::update, Flowsurface::view)
+    let daemon = iced::daemon(Flowsurface::new, Flowsurface::update, Flowsurface::view)
         .settings(iced::Settings {
             antialiasing: true,
             fonts: vec![
                 Cow::Borrowed(style::AZERET_MONO_BYTES),
                 Cow::Borrowed(style::ICONS_BYTES),
             ],
-            default_text_size: iced::Pixels(12.0),
+            default_text_size: style::text_size::BODY.into(),
             ..Default::default()
         })
         .title(Flowsurface::title)
         .theme(Flowsurface::theme)
         .scale_factor(Flowsurface::scale_factor)
-        .subscription(Flowsurface::subscription)
-        .run();
+        .subscription(Flowsurface::subscription);
+
+    if let Err(err) = daemon.run() {
+        let message = format!("Runtime error: {err}");
+        log::error!("{message}");
+        logger::report_stderr(&message);
+    }
 }
 
 struct Flowsurface {
@@ -110,11 +119,6 @@ enum Message {
 impl Flowsurface {
     fn new() -> (Self, Task<Message>) {
         let saved_state = layout::load_saved_state();
-        let handles =
-            exchange::adapter::AdapterHandles::spawn_all(exchange::adapter::AdapterNetworkConfig {
-                proxy_cfg: saved_state.proxy_cfg.clone(),
-            })
-            .expect("Failed to spawn adapter handles");
 
         let (main_window_id, open_main_window) = {
             let (position, size) = saved_state.window();
@@ -126,6 +130,11 @@ impl Flowsurface {
             };
             window::open(config)
         };
+
+        let handles = exchange::adapter::AdapterHandles::spawn_venues(
+            exchange::adapter::Venue::ALL,
+            saved_state.proxy_cfg.as_ref(),
+        );
 
         let (sidebar, launch_sidebar) = dashboard::Sidebar::new(&saved_state, handles.clone());
 
@@ -153,15 +162,29 @@ impl Flowsurface {
                 .push(Toast::error(format!("Audio disabled: {err}")));
         }
 
-        let active_layout_id = state.layout_manager.active_layout_id().unwrap_or(
-            &state
-                .layout_manager
-                .layouts
-                .first()
-                .expect("No layouts available")
-                .id,
-        );
-        let load_layout = state.load_layout(active_layout_id.unique, main_window_id);
+        if state.layout_manager.layouts.is_empty() {
+            log::error!("No layouts available after loading state; creating a default layout");
+            state.layout_manager = LayoutManager::new();
+        }
+
+        let active_layout_id = state
+            .layout_manager
+            .active_layout_id()
+            .or_else(|| {
+                state
+                    .layout_manager
+                    .layouts
+                    .first()
+                    .map(|layout| &layout.id)
+            })
+            .map(|layout| layout.unique);
+
+        let load_layout = active_layout_id
+            .map(|uid| state.load_layout(uid, main_window_id))
+            .unwrap_or_else(|| {
+                log::error!("No active layout could be selected at startup");
+                Task::none()
+            });
 
         (
             state,
@@ -664,7 +687,7 @@ impl Flowsurface {
                                 weight: iced::font::Weight::Bold,
                                 ..Default::default()
                             })
-                            .size(16)
+                            .size(crate::style::text_size::TITLE)
                             .style(style::title_text),
                     )
                     .height(20)
@@ -917,7 +940,8 @@ impl Flowsurface {
                         container(
                             row![
                                 decrease_btn,
-                                text(format!("{:.0}%", current_value * 100.0)).size(14),
+                                text(format!("{:.0}%", current_value * 100.0))
+                                    .size(crate::style::text_size::SECTION),
                                 increase_btn,
                             ]
                             .align_y(Alignment::Center)
@@ -966,12 +990,13 @@ impl Flowsurface {
                     let version_info = {
                         let (version_label, commit_label) = version::app_build_version_parts();
 
-                        let github_link_button = button(text(version_label).size(13))
-                            .padding(0)
-                            .style(style::button::text_link)
-                            .on_press(Message::OpenUrlRequested(Cow::Borrowed(
-                                version::GITHUB_REPOSITORY_URL,
-                            )));
+                        let github_link_button =
+                            button(text(version_label).size(crate::style::text_size::EMPHASIS))
+                                .padding(0)
+                                .style(style::button::text_link)
+                                .on_press(Message::OpenUrlRequested(Cow::Borrowed(
+                                    version::GITHUB_REPOSITORY_URL,
+                                )));
 
                         let github_button: Element<'_, Message> = iced::widget::tooltip(
                             github_link_button,
@@ -992,10 +1017,11 @@ impl Flowsurface {
                         if let (Some(commit_label), Some(commit_url)) =
                             (commit_label, version::build_commit_url())
                         {
-                            let commit_button = button(text(commit_label).size(11))
-                                .padding(0)
-                                .style(style::button::text_link_secondary)
-                                .on_press(Message::OpenUrlRequested(Cow::Owned(commit_url)));
+                            let commit_button =
+                                button(text(commit_label).size(crate::style::text_size::SMALL))
+                                    .padding(0)
+                                    .style(style::button::text_link_secondary)
+                                    .on_press(Message::OpenUrlRequested(Cow::Owned(commit_url)));
 
                             column![github_button, commit_button]
                                 .spacing(2)
@@ -1015,13 +1041,13 @@ impl Flowsurface {
 
                     let column_content = split_column![
                         column![open_data_folder,].spacing(8),
-                        column![text("Sidebar position").size(14), sidebar_pos_picklist,].spacing(12),
-                        column![text("Time zone").size(14), timezone_picklist,].spacing(12),
-                        column![text("Market data").size(14), size_in_quote_currency_checkbox,].spacing(12),
-                        column![text("Theme").size(14), theme_picklist,].spacing(12),
-                        column![text("Interface scale").size(14), scale_factor,].spacing(12),
+                        column![text("Sidebar position").size(crate::style::text_size::SECTION), sidebar_pos_picklist,].spacing(12),
+                        column![text("Time zone").size(crate::style::text_size::SECTION), timezone_picklist,].spacing(12),
+                        column![text("Market data").size(crate::style::text_size::SECTION), size_in_quote_currency_checkbox,].spacing(12),
+                        column![text("Theme").size(crate::style::text_size::SECTION), theme_picklist,].spacing(12),
+                        column![text("Interface scale").size(crate::style::text_size::SECTION), scale_factor,].spacing(12),
                         column![
-                            text("Experimental").size(14),
+                            text("Experimental").size(crate::style::text_size::SECTION),
                             column![trade_fetch_checkbox, toggle_theme_editor, toggle_network_editor].spacing(8),
                         ]
                         .spacing(12),
@@ -1151,7 +1177,20 @@ impl Flowsurface {
                     ]
                     .spacing(8)
                 } else {
-                    column![text("No pane selected"),].spacing(8)
+                    let reset_pane_button =
+                        button(text("Reset").align_x(Alignment::Center)).width(iced::Length::Fill);
+                    let split_pane_button =
+                        button(text("Split").align_x(Alignment::Center)).width(iced::Length::Fill);
+
+                    column![
+                        text("No pane selected"),
+                        row![
+                            tooltip(reset_pane_button, None, TooltipPosition::Top),
+                            tooltip(split_pane_button, None, TooltipPosition::Top),
+                        ]
+                        .spacing(8)
+                    ]
+                    .spacing(8)
                 };
 
                 let manage_layout_modal = {

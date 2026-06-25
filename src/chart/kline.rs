@@ -9,7 +9,8 @@ use data::aggr::ticks::TickAggr;
 use data::aggr::time::TimeSeries;
 use data::chart::indicator::{Indicator, KlineIndicator};
 use data::chart::kline::{
-    ClusterKind, ClusterScaling, FootprintStudy, KlineDataPoint, KlineTrades, NPoc, PointOfControl,
+    ClusterKind, ClusterScaling, Config, FootprintStudy, KlineDataPoint, KlineTrades, NPoc,
+    PointOfControl,
 };
 use data::chart::{Autoscale, KlineChartKind, ViewConfig};
 
@@ -56,6 +57,8 @@ impl Chart for KlineChart {
             return vec![];
         }
 
+        let data_labels_always_visible = self.visual_config.data_labels_always_visible;
+
         let market = chart_state.ticker_info.market_type();
         let mut elements = vec![];
 
@@ -64,7 +67,11 @@ impl Chart for KlineChart {
                 continue;
             }
             if let Some(indi) = self.indicators[*selected_indicator].as_ref() {
-                elements.push(indi.element(chart_state, earliest..=latest));
+                elements.push(indi.element(
+                    chart_state,
+                    data_labels_always_visible,
+                    earliest..=latest,
+                ));
             }
         }
         elements
@@ -160,6 +167,7 @@ pub struct KlineChart {
     request_handler: RequestHandler,
     study_configurator: study::Configurator<FootprintStudy>,
     last_tick: Instant,
+    visual_config: Config,
 }
 
 impl KlineChart {
@@ -172,7 +180,10 @@ impl KlineChart {
         enabled_indicators: &[KlineIndicator],
         ticker_info: TickerInfo,
         kind: &KlineChartKind,
+        visual_config: Option<Config>,
     ) -> Self {
+        let visual_config = visual_config.unwrap_or_default();
+
         match basis {
             Basis::Time(interval) => {
                 let timeseries = TimeSeries::<KlineDataPoint>::new(interval, step, klines_raw)
@@ -212,7 +223,7 @@ impl KlineChart {
                     step.decimal_places(),
                     ticker_info,
                     ViewConfig {
-                        splits: layout.splits,
+                        splits: layout.splits.clone(),
                         autoscale: Some(Autoscale::FitToVisible),
                     },
                     cell_width,
@@ -244,6 +255,7 @@ impl KlineChart {
 
                 KlineChart {
                     chart,
+                    visual_config,
                     data_source,
                     raw_trades,
                     indicators,
@@ -270,7 +282,7 @@ impl KlineChart {
                     step.decimal_places(),
                     ticker_info,
                     ViewConfig {
-                        splits: layout.splits,
+                        splits: layout.splits.clone(),
                         autoscale: Some(Autoscale::FitToVisible),
                     },
                     cell_width,
@@ -300,6 +312,7 @@ impl KlineChart {
 
                 KlineChart {
                     chart,
+                    visual_config,
                     data_source,
                     raw_trades,
                     indicators,
@@ -486,6 +499,19 @@ impl KlineChart {
 
     pub fn chart_layout(&self) -> ViewConfig {
         self.chart.layout()
+    }
+
+    pub fn visual_config(&self) -> Config {
+        self.visual_config
+    }
+
+    pub fn set_visual_config(&mut self, visual_config: Config) {
+        self.visual_config = visual_config;
+        self.chart.cache.clear_all();
+        self.indicators
+            .values_mut()
+            .filter_map(Option::as_mut)
+            .for_each(|indi| indi.clear_all_caches());
     }
 
     pub fn set_cluster_kind(&mut self, new_kind: ClusterKind) {
@@ -686,7 +712,7 @@ impl KlineChart {
         lowest: Price,
         step: PriceStep,
         cluster_kind: ClusterKind,
-    ) -> f32 {
+    ) -> f64 {
         let rounded_highest = highest.round_to_side_step(false, step).add_steps(1, step);
         let rounded_lowest = lowest.round_to_side_step(true, step).add_steps(-1, step);
 
@@ -699,7 +725,7 @@ impl KlineChart {
                     rounded_highest,
                     rounded_lowest,
                 )
-                .into(),
+                .to_f64(),
             PlotData::TickBased(tick_aggr) => {
                 let earliest = earliest as usize;
                 let latest = latest as usize;
@@ -712,7 +738,7 @@ impl KlineChart {
                         rounded_highest,
                         rounded_lowest,
                     )
-                    .into()
+                    .to_f64()
             }
         }
     }
@@ -1037,6 +1063,9 @@ impl canvas::Program<Message> for KlineChart {
         });
 
         let crosshair = chart.cache.crosshair.draw(renderer, bounds_size, |frame| {
+            let visible_region = chart.visible_region(bounds_size);
+            let visible_range = chart.interval_range(&visible_region);
+
             if let Some(cursor_position) = cursor.position_in(bounds) {
                 let (_, rounded_aggregation) =
                     chart.draw_crosshair(frame, theme, bounds_size, cursor_position, interaction);
@@ -1046,7 +1075,19 @@ impl canvas::Program<Message> for KlineChart {
                     &chart.ticker_info,
                     frame,
                     palette,
-                    rounded_aggregation,
+                    chart.basis,
+                    Some(rounded_aggregation),
+                    visible_range,
+                );
+            } else if self.visual_config.data_labels_always_visible {
+                draw_crosshair_tooltip(
+                    &self.data_source,
+                    &chart.ticker_info,
+                    frame,
+                    palette,
+                    chart.basis,
+                    None,
+                    visible_range,
                 );
             }
         });
@@ -1354,10 +1395,10 @@ fn draw_all_npocs(
 
 fn effective_cluster_qty(
     scaling: ClusterScaling,
-    visible_max: f32,
+    visible_max: f64,
     footprint: &KlineTrades,
     cluster_kind: ClusterKind,
-) -> f32 {
+) -> f64 {
     let individual_max = match cluster_kind {
         ClusterKind::BidAsk => footprint
             .trades
@@ -1378,14 +1419,13 @@ fn effective_cluster_qty(
             .max()
             .unwrap_or_default(),
     };
-    let individual_max_f32 = f32::from(individual_max);
 
     match scaling {
         ClusterScaling::VisibleRange => Qty::scale_or_one(visible_max),
         ClusterScaling::Datapoint => individual_max.to_scale_or_one(),
         ClusterScaling::Hybrid { weight } => {
-            let w = weight.clamp(0.0, 1.0);
-            Qty::scale_or_one(visible_max * w + individual_max_f32 * (1.0 - w))
+            let w = weight.clamp(0.0, 1.0) as f64;
+            Qty::scale_or_one(visible_max * w + individual_max.to_f64() * (1.0 - w))
         }
     }
 }
@@ -1397,7 +1437,7 @@ fn draw_clusters(
     cell_width: f32,
     cell_height: f32,
     candle_width: f32,
-    max_cluster_qty: f32,
+    max_cluster_qty: f64,
     palette: &Extended,
     text_size: f32,
     step: PriceStep,
@@ -1429,8 +1469,8 @@ fn draw_clusters(
             let bar_alpha = if show_text { 0.25 } else { 1.0 };
 
             for (price, group) in &footprint.trades {
-                let buy_qty = f32::from(group.buy_qty);
-                let sell_qty = f32::from(group.sell_qty);
+                let buy_qty = group.buy_qty.to_f64();
+                let sell_qty = group.sell_qty.to_f64();
                 let y = price_to_y(*price);
 
                 match cluster_kind {
@@ -1453,7 +1493,7 @@ fn draw_clusters(
                         if show_text {
                             draw_cluster_text(
                                 frame,
-                                &abbr_large_numbers(f32::from(group.total_qty())),
+                                &abbr_large_numbers(f64::from(group.total_qty())),
                                 Point::new(area.bars_left, y),
                                 text_size,
                                 text_color,
@@ -1463,7 +1503,7 @@ fn draw_clusters(
                         }
                     }
                     ClusterKind::DeltaProfile => {
-                        let delta = f32::from(group.delta_qty());
+                        let delta = group.delta_qty().to_f64();
                         if show_text {
                             draw_cluster_text(
                                 frame,
@@ -1476,7 +1516,7 @@ fn draw_clusters(
                             );
                         }
 
-                        let bar_width = (delta.abs() / max_cluster_qty) * area.bars_width;
+                        let bar_width = (delta.abs() / max_cluster_qty) as f32 * area.bars_width;
                         if bar_width > 0.0 {
                             let color = if delta >= 0.0 {
                                 palette.success.base.color.scale_alpha(bar_alpha)
@@ -1494,8 +1534,7 @@ fn draw_clusters(
                 }
 
                 if let Some((threshold, color_scale, ignore_zeros)) = imbalance {
-                    let higher_price =
-                        Price::from_f32(price.to_f32() + step.to_f32_lossy()).round_to_step(step);
+                    let higher_price = price.add_steps(1, step);
 
                     let rect_w = ((area.imb_marker_width - 1.0) / 2.0).max(1.0);
                     let buyside_x = area.imb_marker_left + area.imb_marker_width - rect_w;
@@ -1556,8 +1595,8 @@ fn draw_clusters(
             let left_area_width = (area.ask_area_right - left_min_x).max(0.0);
 
             for (price, group) in &footprint.trades {
-                let buy_qty = f32::from(group.buy_qty);
-                let sell_qty = f32::from(group.sell_qty);
+                let buy_qty = group.buy_qty.to_f64();
+                let sell_qty = group.sell_qty.to_f64();
                 let y = price_to_y(*price);
 
                 if buy_qty > 0.0 && right_area_width > 0.0 {
@@ -1573,7 +1612,7 @@ fn draw_clusters(
                         );
                     }
 
-                    let bar_width = (buy_qty / max_cluster_qty) * right_area_width;
+                    let bar_width = (buy_qty / max_cluster_qty) as f32 * right_area_width;
                     if bar_width > 0.0 {
                         frame.fill_rectangle(
                             Point::new(area.bid_area_left, y - (cell_height / 2.0)),
@@ -1595,7 +1634,7 @@ fn draw_clusters(
                         );
                     }
 
-                    let bar_width = (sell_qty / max_cluster_qty) * left_area_width;
+                    let bar_width = (sell_qty / max_cluster_qty) as f32 * left_area_width;
                     if bar_width > 0.0 {
                         frame.fill_rectangle(
                             Point::new(area.ask_area_right, y - (cell_height / 2.0)),
@@ -1608,8 +1647,7 @@ fn draw_clusters(
                 if let Some((threshold, color_scale, ignore_zeros)) = imbalance
                     && area.imb_marker_width > 0.0
                 {
-                    let higher_price =
-                        Price::from_f32(price.to_f32() + step.to_f32_lossy()).round_to_step(step);
+                    let higher_price = price.add_steps(1, step);
 
                     let rect_width = ((area.imb_marker_width - 1.0) / 2.0).max(1.0);
 
@@ -1647,9 +1685,9 @@ fn draw_clusters(
     }
 
     if show_text {
-        let mut total_buy = Qty::zero();
-        let mut total_sell = Qty::zero();
-        let mut total_delta = Qty::zero();
+        let mut total_buy = Qty::ZERO;
+        let mut total_sell = Qty::ZERO;
+        let mut total_delta = Qty::ZERO;
 
         for group in footprint.trades.values() {
             total_buy += group.buy_qty;
@@ -1664,7 +1702,7 @@ fn draw_clusters(
 
         draw_cluster_text(
             frame,
-            &format!("V: {}", abbr_large_numbers(total_vol.to_f32_lossy())),
+            &format!("V: {}", abbr_large_numbers(total_vol.to_f64())),
             Point::new(x_position, summary_y),
             text_size * 0.9,
             palette.background.weakest.text,
@@ -1672,7 +1710,7 @@ fn draw_clusters(
             Alignment::Start,
         );
 
-        let delta_color = if total_delta >= Qty::zero() {
+        let delta_color = if total_delta >= Qty::ZERO {
             palette.success.base.color
         } else {
             palette.danger.base.color
@@ -1680,7 +1718,7 @@ fn draw_clusters(
 
         draw_cluster_text(
             frame,
-            &format!("Δ: {}", abbr_large_numbers(total_delta.to_f32_lossy())),
+            &format!("Δ: {}", abbr_large_numbers(total_delta.to_f64())),
             Point::new(x_position, summary_y + line_spacing),
             text_size * 0.9,
             delta_color,
@@ -1695,7 +1733,7 @@ fn draw_imbalance_markers(
     price_to_y: &impl Fn(Price) -> f32,
     footprint: &KlineTrades,
     price: Price,
-    sell_qty: f32,
+    sell_qty: f64,
     higher_price: Price,
     threshold: usize,
     color_scale: Option<usize>,
@@ -1711,7 +1749,7 @@ fn draw_imbalance_markers(
     }
 
     if let Some(group) = footprint.trades.get(&higher_price) {
-        let diagonal_buy_qty = f32::from(group.buy_qty);
+        let diagonal_buy_qty = group.buy_qty.to_f64();
 
         if ignore_zeros && diagonal_buy_qty <= 0.0 {
             return;
@@ -1719,17 +1757,17 @@ fn draw_imbalance_markers(
 
         let rect_height = cell_height / 2.0;
 
-        let alpha_from_ratio = |ratio: f32| -> f32 {
+        let alpha_from_ratio = |ratio: f64| -> f32 {
             if let Some(scale) = color_scale {
-                let divisor = (scale as f32 / 10.0) - 1.0;
-                (0.2 + 0.8 * ((ratio - 1.0) / divisor).min(1.0)).min(1.0)
+                let divisor = (scale as f64 / 10.0) - 1.0;
+                (0.2 + 0.8 * ((ratio - 1.0) / divisor).min(1.0)).min(1.0) as f32
             } else {
                 1.0
             }
         };
 
         if diagonal_buy_qty >= sell_qty {
-            let required_qty = sell_qty * (100 + threshold) as f32 / 100.0;
+            let required_qty = sell_qty * (100 + threshold) as f64 / 100.0;
             if diagonal_buy_qty > required_qty {
                 let ratio = diagonal_buy_qty / required_qty;
                 let alpha = alpha_from_ratio(ratio);
@@ -1742,7 +1780,7 @@ fn draw_imbalance_markers(
                 );
             }
         } else {
-            let required_qty = diagonal_buy_qty * (100 + threshold) as f32 / 100.0;
+            let required_qty = diagonal_buy_qty * (100 + threshold) as f64 / 100.0;
             if sell_qty > required_qty {
                 let ratio = sell_qty / required_qty;
                 let alpha = alpha_from_ratio(ratio);
@@ -1806,38 +1844,84 @@ fn draw_crosshair_tooltip(
     ticker_info: &TickerInfo,
     frame: &mut canvas::Frame,
     palette: &Extended,
-    at_interval: u64,
+    basis: Basis,
+    at_interval: Option<u64>,
+    visible_range: (u64, u64),
 ) {
-    let kline_opt = match data {
-        PlotData::TimeBased(timeseries) => timeseries
-            .datapoints
-            .iter()
-            .find(|(time, _)| **time == UnixMs::new(at_interval))
-            .map(|(_, dp)| &dp.kline)
-            .or_else(|| {
-                if timeseries.datapoints.is_empty() {
-                    None
-                } else {
-                    let (last_time, dp) = timeseries.datapoints.last_key_value()?;
-                    if at_interval > last_time.as_u64() {
-                        Some(&dp.kline)
+    let (visible_earliest, visible_latest) = visible_range;
+
+    let kline_opt = match (data, at_interval) {
+        (PlotData::TimeBased(timeseries), Some(at_interval)) => {
+            let in_visible = at_interval >= visible_earliest && at_interval <= visible_latest;
+
+            timeseries
+                .datapoints
+                .get(&UnixMs::new(at_interval))
+                .map(|dp| &dp.kline)
+                .or_else(|| {
+                    if in_visible {
+                        let search_end = at_interval.min(visible_latest);
+                        timeseries
+                            .datapoints
+                            .range(UnixMs::new(visible_earliest)..=UnixMs::new(search_end))
+                            .next_back()
+                            .map(|(_, dp)| &dp.kline)
                     } else {
                         None
                     }
-                }
-            }),
-        PlotData::TickBased(tick_aggr) => {
-            let index = (at_interval / u64::from(tick_aggr.interval.0)) as usize;
-            if index < tick_aggr.datapoints.len() {
-                Some(&tick_aggr.datapoints[tick_aggr.datapoints.len() - 1 - index].kline)
-            } else {
-                None
-            }
+                })
+                .or_else(|| {
+                    let right_of_latest = match basis {
+                        Basis::Time(_) => at_interval > visible_latest,
+                        Basis::Tick(_) => at_interval < visible_earliest,
+                    };
+
+                    if right_of_latest {
+                        timeseries
+                            .datapoints
+                            .range(UnixMs::new(visible_earliest)..=UnixMs::new(visible_latest))
+                            .next_back()
+                            .map(|(_, dp)| &dp.kline)
+                    } else {
+                        None
+                    }
+                })
+                .or_else(|| {
+                    let (last_time, dp) = timeseries.datapoints.last_key_value()?;
+                    (at_interval > last_time.as_u64()).then_some(&dp.kline)
+                })
         }
+        (PlotData::TickBased(tick_aggr), Some(at_interval)) => {
+            let kline_at = |interval: u64| {
+                let index = (interval / u64::from(tick_aggr.interval.0)) as usize;
+                (index < tick_aggr.datapoints.len())
+                    .then(|| &tick_aggr.datapoints[tick_aggr.datapoints.len() - 1 - index].kline)
+            };
+
+            let in_visible = at_interval >= visible_earliest && at_interval <= visible_latest;
+
+            kline_at(at_interval).or_else(|| {
+                let right_of_latest = match basis {
+                    Basis::Time(_) => at_interval > visible_latest,
+                    Basis::Tick(_) => at_interval < visible_earliest,
+                };
+
+                if in_visible || right_of_latest {
+                    kline_at(visible_earliest)
+                } else {
+                    None
+                }
+            })
+        }
+        (PlotData::TimeBased(timeseries), None) => timeseries
+            .datapoints
+            .last_key_value()
+            .map(|(_, dp)| &dp.kline),
+        (PlotData::TickBased(tick_aggr), None) => tick_aggr.datapoints.last().map(|dp| &dp.kline),
     };
 
     if let Some(kline) = kline_opt {
-        let change_pct = ((kline.close - kline.open).to_f32() / kline.open.to_f32()) * 100.0;
+        let change_pct = ((kline.close - kline.open) / kline.open * 100.0) as f32;
         let change_color = if change_pct >= 0.0 {
             palette.success.base.color
         } else {
@@ -1884,7 +1968,7 @@ fn draw_crosshair_tooltip(
             frame.fill_text(canvas::Text {
                 content: text.to_string(),
                 position: Point::new(x, position.y),
-                size: iced::Pixels(12.0),
+                size: iced::Pixels(crate::style::text_size::BODY),
                 color: seg_color,
                 font: style::AZERET_MONO,
                 ..canvas::Text::default()

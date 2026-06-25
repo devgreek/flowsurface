@@ -18,7 +18,7 @@ use std::{collections::BTreeMap, ops::RangeInclusive};
 
 pub struct OpenInterestIndicator {
     cache: Caches,
-    pub data: BTreeMap<UnixMs, f32>,
+    pub data: BTreeMap<UnixMs, f64>,
 }
 
 impl OpenInterestIndicator {
@@ -32,6 +32,7 @@ impl OpenInterestIndicator {
     fn indicator_elem<'a>(
         &'a self,
         main_chart: &'a ViewState,
+        data_labels_always_visible: bool,
         visible_range: RangeInclusive<u64>,
     ) -> iced::Element<'a, Message> {
         if let Some(message) = self.unavailable_message(main_chart, "Open Interest") {
@@ -43,7 +44,7 @@ impl OpenInterestIndicator {
             return row![].into();
         }
 
-        let tooltip = |value: &f32, next: Option<&f32>| {
+        let tooltip = |value: &f64, next: Option<&f64>| {
             let value_text = format!("Open Interest: {}", format_with_commas(*value));
             let change_text = if let Some(next_value) = next {
                 let delta = next_value - *value;
@@ -55,7 +56,7 @@ impl OpenInterestIndicator {
             PlotTooltip::new(format!("{value_text}\n{change_text}"))
         };
 
-        let value_fn = |v: &f32| *v;
+        let value_fn = |v: &f64| *v as f32;
 
         let plot = LinePlot::new(value_fn)
             .stroke_width(1.0)
@@ -70,6 +71,7 @@ impl OpenInterestIndicator {
         indicator_row(
             main_chart,
             &self.cache,
+            data_labels_always_visible,
             plot,
             AnySeries::forward_unix_ms(&self.data),
             visible_range,
@@ -127,9 +129,10 @@ impl KlineIndicatorImpl for OpenInterestIndicator {
     fn element<'a>(
         &'a self,
         chart: &'a ViewState,
+        data_labels_always_visible: bool,
         visible_range: RangeInclusive<u64>,
     ) -> iced::Element<'a, Message> {
-        self.indicator_elem(chart, visible_range)
+        self.indicator_elem(chart, data_labels_always_visible, visible_range)
     }
 
     fn availability(&self, chart: &ViewState) -> IndicatorAvailability {
